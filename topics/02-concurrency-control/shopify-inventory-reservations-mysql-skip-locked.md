@@ -865,6 +865,64 @@ SELECT pg_try_advisory_xact_lock(10001); -- 10001 为 item_id
 
 ---
 
+### 11.6 深入底牌：如果没有外部连接池（No pgBouncer），PG 该如何硬抗高并发？
+
+在实际架构中，如果团队没有条件或由于架构限制没有部署独立的连接池中间件（如 pgBouncer、pgcat、RDS Proxy），由于 **PostgreSQL 采用单连接单进程模型（Process-per-Connection，每个连接 fork 一个独立进程，初始占用 5~10MB 内存）**，面对数千并发连接冲击，极易遭遇所谓的**“连接断崖（Connection Cliff）”**。
+
+在无外部连接池架构下，必须依靠**“应用端强收敛 + 极致单事务毫秒化 + PG 内核参数自御”**三大法则来应对：
+
+```text
+┌───────────────────────────────────────────────────────────────────────────┐
+│              无外部连接池（No pgBouncer）时的 PG 自御架构                 │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  1.【应用层池化收敛】: 依靠客户端连接池（如 HikariCP / Go sql.DB）收敛连接  │
+│     * 核心公式: Max Connections = (CPU Core × 2) + 磁盘数 ≈ 30 ~ 64       │
+│                                                                           │
+│  2.【微秒级单 SQL 事务】: 严禁显式长事务！依赖可写 CTE（1 条 SQL 即 1 事务） │
+│     * 借出连接 -> 执行 1 条 CTE SQL (耗时 1.5ms) -> 立即归还应用池       │
+│     * 64 个连接即可支撑: 64 ÷ 0.0015s ≈ 42,000+ QPS 极限预占吞吐!         │
+│                                                                           │
+│  3.【内核自御死锁与僵尸清理】:                                           │
+│     * idle_in_transaction_session_timeout = '3s' (杀掉悬挂长事务)           │
+│     * statement_timeout = '2s' (防止慢查询拖死)                            │
+│     * 严禁无脑调大 max_connections (保持 150~200，避免 ProcArray 锁自锁)  │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1. 破除认知误区：不要调大 `max_connections`！
+很多团队看到连接不够用，盲目将 PG 的 `max_connections` 调到 1000 甚至 5000，这是自杀行为：
+- PG 内核每生成一个事务快照（Snapshot），都需要遍历 `ProcArray`（所有活跃进程数组）并加自旋锁（Spinlock）；
+- 当活跃进程数超过数百时，**CPU 会 100% 消耗在 ProcArray 自旋锁和操作系统进程上下文切换上，导致吞吐量断崖式暴跌为 0**；
+- **正确姿势**：坚决将 PG 的 `max_connections` 控制在 **150 ~ 250** 以内。
+
+#### 2. 算力账单推演：为什么 64 个连接就能支撑 40,000+ QPS？
+根据利特尔法则（Little's Law）与 HikariCP 黄金连接池公式：
+$$\text{Throughput (QPS)} = \frac{\text{Pool Connections}}{\text{Transaction Duration (Seconds)}}$$
+- 由于前面提到的 **可写 CTE（Writable CTE）** 将原本 MySQL 的 4 步事务压缩为**单条 SQL 自动提交（Auto-Commit）**；
+- 单条 SQL 执行仅需 **1.5 毫秒（0.0015 秒）**，执行完毕后应用层立刻将连接归还连接池；
+- 此时：
+  $$\text{QPS} = \frac{64}{0.0015} \approx 42,666 \text{ QPS}$$
+  这意味着，**只要单事务不拖泥带水，哪怕只有 64 个物理进程连接，理论上也能瞬间抗下每秒 4.2 万笔秒杀预占！**
+
+#### 3. 内核层防御参数硬核配置
+在 `postgresql.conf` 中必须配置强硬的超时机制，防止任何代码意外占用进程：
+```ini
+# 1. 彻底杜绝“开启事务后等待外部调用/休眠”的僵尸连接（超 3 秒强制掐断）
+idle_in_transaction_session_timeout = 3000
+
+# 2. 单条查询超时熔断（防止锁扫描或大表全表扫描霸占连接超 2 秒）
+statement_timeout = 2000
+
+# 3. 客户端连接断开快速感知（配合 TCP Keepalive）
+tcp_keepalives_idle = 30
+tcp_keepalives_interval = 5
+tcp_keepalives_count = 3
+```
+
+---
+
 ## 10. 业界类似开源项目与参考实现 (Open Source Ecosystem & Reference Implementations)
 
 在开源社区中，虽然大多数系统仍停留在“Redis 扣减 + MySQL 异步落盘”的传统方案，但越来越多的前沿项目已经开始全面转向由 `SKIP LOCKED` 驱动的数据库原生无锁高并发设计。以下是五个维度的典型代表：
