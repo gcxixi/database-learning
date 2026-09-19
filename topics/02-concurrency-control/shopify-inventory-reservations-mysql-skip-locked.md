@@ -189,6 +189,79 @@ flowchart TD
 
 ---
 
+### 2.5 核心认知澄清：物理行锁（毫秒级）vs 业务租约（分钟级）
+
+初读该方案的工程师最容易产生一个严重误解：  
+> *“如果买家付款需要 5~10 分钟，难道 MySQL 的行锁要一直锁 10 分钟吗？那连接池岂不是瞬间被彻底占满崩溃？”*
+
+答案是：**绝对不是！** 这里存在两层完全不同生命周期的“锁定”概念：
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│             物理数据库锁 vs 业务预占租约 生命周期对比                   │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│ 1. 物理行锁 (Database Row Lock): 仅在毫秒级事务内持有                   │
+│    [BEGIN] -> [SELECT ... FOR UPDATE] -> [DELETE/INSERT] -> [COMMIT]   │
+│    └── 持有时长: 仅 5 ~ 15 毫秒! 提交后物理锁和数据库连接立即释放! ───┘│
+│                                                                        │
+│ 2. 业务预占租约 (Business Reservation Lease): 通过“数据搬运”持有       │
+│    从 available_units 移除，存入 reserved_units (带 expires_at)        │
+│    └── 持续时长: 5 ~ 10 分钟 (等待买家在支付网关付款完成) ─────────────┘│
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 完整时序：在什么时间点锁定？在什么时间点解锁？
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Buyer as 买家
+    participant Checkout as 结账服务
+    participant DB as MySQL (available_units / reserved_units)
+    participant Payment as 外部支付网关 (Stripe/PayPal/银行)
+
+    Note over Buyer, DB: 阶段一：锁定 (开始结账并预占)
+    Buyer->>Checkout: 1. 点击“完成购买” (发起预占)
+    activate Checkout
+    Checkout->>DB: 2. BEGIN 事务
+    DB-->>DB: 3. 【物理加锁】SELECT ... FOR UPDATE SKIP LOCKED (持有物理行锁)
+    DB-->>DB: 4. INSERT INTO reserved_units (带有 expires_at = NOW() + 10m)
+    DB-->>DB: 5. DELETE FROM available_units
+    Checkout->>DB: 6. COMMIT 事务
+    DB-->>DB: 7. 【物理立即解锁】释放物理行锁与连接！(全过程耗时 5~15ms)
+    Checkout-->>Buyer: 8. 返回预占成功，引导至支付页
+    deactivate Checkout
+    
+    Note over DB: 此时【业务锁定生效】：记录已在 reserved_units 中，其他买家看不到这几行
+
+    Note over Buyer, Payment: 阶段二：等待买家付款 (耗时数十秒至数分钟，不占用任何 DB 连接)
+    Buyer->>Payment: 9. 扫码或输信用卡付款
+
+    alt 场景 A：付款成功 (终态核销 - 解除业务预占)
+        Payment-->>Checkout: 10. 支付成功 Webhook 回调
+        activate Checkout
+        Checkout->>DB: 11. 执行 Claim 事务：从 reserved_units 删除该行，物理账本永久记账
+        Checkout->>DB: 12. COMMIT (业务锁定终结，物理落袋)
+        deactivate Checkout
+    else 场景 B：买家主动取消结账 (主动释放解锁)
+        Buyer->>Checkout: 10. 点击“放弃支付”
+        activate Checkout
+        Checkout->>DB: 11. 执行 Release 事务：从 reserved_units 删掉，插回 available_units
+        Checkout->>DB: 12. COMMIT (业务锁立即解除，重回可用池供他人抢购)
+        deactivate Checkout
+    else 场景 C：买家超时未付 (超时被动释放解锁)
+        Note over DB: 超过 10 分钟，买家离开页面
+        participant Janitor as 后台清理任务 (Sweeper Job)
+        Janitor->>DB: 11. 扫描 expires_at < NOW() 的过期预占行
+        Janitor->>DB: 12. 批量将过期行从 reserved_units 移回 available_units
+        Janitor->>DB: 13. COMMIT (业务锁被动超时解除，库存重新对外界可见)
+    end
+```
+
+---
+
 ## 3. 四大 InnoDB 内核级工程关键决策深度剖析
 
 将上述算法落实到 MySQL 8 时，必须深入到 InnoDB 的底层加锁与存储引擎原理。Shopify 团队在排查高并发问题时，总结了四项决定系统成败的关键决策。
