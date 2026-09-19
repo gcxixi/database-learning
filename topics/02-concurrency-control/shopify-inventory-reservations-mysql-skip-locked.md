@@ -759,6 +759,43 @@ flowchart LR
 
 ---
 
+## 10. 业界类似开源项目与参考实现 (Open Source Ecosystem & Reference Implementations)
+
+在开源社区中，虽然大多数系统仍停留在“Redis 扣减 + MySQL 异步落盘”的传统方案，但越来越多的前沿项目已经开始全面转向由 `SKIP LOCKED` 驱动的数据库原生无锁高并发设计。以下是五个维度的典型代表：
+
+### 10.1 方案直接灵感来源：数据库驱动的无锁负载分发
+Shopify 在博文中明确提及，其架构灵感直接来源于 **37signals** 在数据库负载分发上的实践：
+* **[rails/solid_queue](https://github.com/rails/solid_queue)** (Ruby / Rails 8 官方标配)
+  - **核心设计**：37signals 推出用于全面替代 Redis (Sidekiq) 的数据库原生作业队列。
+  - **并发机制**：多个 Worker 进程并发拉取任务时，核心 SQL 即为 `SELECT ... FROM solid_queue_ready_executions WHERE ... ORDER BY priority ASC LIMIT 1 FOR UPDATE SKIP LOCKED`。
+  - **收益**：利用 MySQL 8 / PostgreSQL 的 `SKIP LOCKED` 彻底消除了 Worker 之间的行锁排队等待，免除了维护 Redis 集群的复杂度和数据丢失风险。
+* **[riverqueue/river](https://github.com/riverqueue/river)** (Go / PostgreSQL)
+  - **核心设计**：Go 语言生态中极高性能的高吞吐事务型后台任务引擎。
+  - **并发机制**：同样深度利用 Postgres 的 `FOR UPDATE SKIP LOCKED`，天然支持在同一个业务 DB 事务中原子提交“业务写入 + 任务入队”，彻底根除跨异构系统的分布式事务不一致。
+* **[pg-boss](https://github.com/timgit/pg-boss)** (Node.js / PostgreSQL) & **[good_job](https://github.com/bensheldon/good_job)** (Ruby / Postgres)
+  - 在 Node.js 和 Ruby 生态中广泛应用的基于 `SKIP LOCKED` 的无锁并发资源调度库。
+
+### 10.2 开源电商与库存预占系统 (E-Commerce Stock Reservation)
+* **[saleor/saleor](https://github.com/saleor/saleor)** (Python / Django / GraphQL)
+  - **核心设计**：顶级开源无头电商（Headless Commerce）。
+  - **预占机制**：原生内置 **Stock Reservation** 模块（`StockReservation` 与 `CheckoutLineReservation`）。支持为不同销售渠道（Channel）配置不同的结账预占持有时间（`reserveStockDurationAnonymousUser`），具备多仓库优先级履约分配策略（Allocation Strategy）与超时未付自动作废机制。
+* **[medusajs/medusa](https://github.com/medusajs/medusa)** (Node.js / TypeScript)
+  - **核心设计**：Medusa 2.0 拥有独立的 **Inventory Module**。
+  - **预占机制**：结账时生成 `reservation_item` 实体，通过 `LockingModule` 在多履约中心（Stock Locations）间安全预占库存，防止并发加购导致超卖。
+* **[spree/spree](https://github.com/spree/spree)** & **[solidusio/solidus](https://github.com/solidusio/solidus)** (Ruby on Rails)
+  - **核心设计**：历史悠久的经典开源电商框架。
+  - **单元化模型**：其底层的 `spree_inventory_units` 数据表天然采用与 Shopify 相同的**“1 row = 1 unit”**物理模型，用于精确追踪每个实物单元的在途、预占与发货状态。
+
+### 10.3 票务与离散席位预约系统 (Seat & Ticket Reservation)
+* **[kristijorgji/seat-reservation-system](https://github.com/kristijorgji/seat-reservation-system)** 及各类开源码力票务 Demo：
+  - 展示了电影院、演唱会固定座位的无争用选座方案：`SELECT seat_id FROM available_seats WHERE show_id = ? LIMIT 2 FOR UPDATE SKIP LOCKED`，实现了离散资源在并发选座时的秒级隔离。
+
+### 10.4 基础设施与连接治理生态
+* **[ProxySQL](https://github.com/sysown/proxysql)** (C++)
+  - Shopify 方案中实现“连接可见性（Connection Visibility）”的功臣。ProxySQL 具备在不侵入应用代码的情况下，动态解析 SQL 注释标签、统计后端各连接池持有时间、实施读写分离和慢事务熔断的强大能力。
+
+---
+
 ## 9. 架构启示与工程方法论
 
 从 Shopify 这次从 Redis 回归 MySQL 的重大架构演进中，我们能够提炼出三条极具普适价值的现代架构设计工程方法论：
