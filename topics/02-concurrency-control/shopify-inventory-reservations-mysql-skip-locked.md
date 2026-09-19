@@ -759,6 +759,112 @@ flowchart LR
 
 ---
 
+## 11. PostgreSQL 深度技术对比：PG 能否实现？甚至能做得更好？
+
+许多使用 PostgreSQL 的工程师自然会追问：**PostgreSQL 是否支持这套方案？在 PG 下落地表现如何？**
+
+结论是：**PostgreSQL 不仅完全支持这套方案，而且比 MySQL 出现得更早、语法表达更优雅、锁机制更加纯粹，但在底层 MVCC 存储引擎机制上有着不同的调优侧重点。**
+
+---
+
+### 11.1 历史渊源：PG 是 `SKIP LOCKED` 的开创先驱
+* **PostgreSQL**：早在 **2016 年发布的 PostgreSQL 9.5** 中就已原生正式引入了 `FOR UPDATE SKIP LOCKED` 与 `FOR SHARE SKIP LOCKED`；
+* **MySQL**：直到 **2018 年发布的 MySQL 8.0** 才作为新特性跟进。
+在开源生态中（如著名的 `pg-boss`、`river`、`good_job`），PG 作为高性能无锁任务队列和资源调度器的历史，比 MySQL 更加悠久成熟。
+
+---
+
+### 11.2 语法维度的降维打击：可写 CTE（Writable CTE）单条 SQL 完成“查、锁、删、插”
+
+在 MySQL 8 中，由于不支持可写公共表表达式（Data-modifying CTE），且 `DELETE` 不支持 `RETURNING`，Shopify 不得不在应用层开启多语句的显式事务：
+1. `BEGIN;`
+2. `SELECT id ... FOR UPDATE SKIP LOCKED;` （拿到选中的 ID 列表返回给应用）
+3. `INSERT INTO reserved_units VALUES (...);` （将应用内存中的 ID 插入预占表）
+4. `DELETE FROM available_units WHERE id IN (...);` （从可用池删除）
+5. `COMMIT;`
+这导致了**至少 3 次应用到数据库的网络往返（Round Trips）**，连接持有时间被成倍拉长。
+
+#### PostgreSQL 的极致优雅实现
+在 PostgreSQL 中，利用 **带有 `RETURNING` 的可写 CTE（Writable CTE）**，可以在**单条 SQL、单次网络往返（1 RTT）**内原子完成全流程：
+
+```sql
+-- PostgreSQL 原生原子预占：单条 SQL 完成 选定、锁定、转移、返回！
+WITH locked_units AS (
+    -- 1. 扫描可用池，锁定 N 个可用单元，自动跳过被锁行
+    SELECT id, shop_id, inventory_item_id, inventory_group_id
+    FROM available_units
+    WHERE shop_id = 1 
+      AND inventory_item_id = 100 
+      AND inventory_group_id = 1
+    ORDER BY id ASC
+    LIMIT 3
+    FOR UPDATE SKIP LOCKED
+),
+deleted_from_available AS (
+    -- 2. 直接从可用池中移除这些被锁定的单元行
+    DELETE FROM available_units
+    WHERE (shop_id, inventory_item_id, inventory_group_id, id) IN (
+        SELECT shop_id, inventory_item_id, inventory_group_id, id 
+        FROM locked_units
+    )
+)
+-- 3. 将被删除的单元原子写入预占表，并设置 10 分钟租约与 cart_token
+INSERT INTO reserved_units (unit_id, shop_id, inventory_item_id, inventory_group_id, cart_token, expires_at)
+SELECT id, shop_id, inventory_item_id, inventory_group_id, 'cart_token_999', NOW() + INTERVAL '10 minutes'
+FROM locked_units
+RETURNING unit_id;
+```
+
+* **彻底免去应用层多次网络交互**；
+* **物理连接持有时间被压缩至微秒级**，从物理上几乎消除了连接池积压。
+
+---
+
+### 11.3 锁机制对比：天然免疫“间隙锁（Gap Lock）”
+* **MySQL 的痛点**：InnoDB 默认的 `REPEATABLE READ` 依赖 Next-Key Lock 和 Supremum Lock，在扫描空表或边界时会锁死区间，直接把并发补货阻断，Shopify 被迫降级至 `READ COMMITTED`。
+* **PostgreSQL 的天然优势**：
+  - PostgreSQL 的行级排他锁直接打在数据行元组头（Tuple Header 的 `xmax` 字段）上；
+  - **在 `READ COMMITTED` 和 `REPEATABLE READ` 下，PG 根本没有“间隙锁（Gap Lock）”这一概念**（PG 仅在严格可串行化 `SERIALIZABLE` 隔离级别下使用轻量的 SIREAD 谓词锁）；
+  - 因此，PG 在执行 `LIMIT N FOR UPDATE SKIP LOCKED` 扫描空表或末尾时，**绝对不会阻碍其他并发事务向该表执行 `INSERT` 补货**，天然不会产生 MySQL 中的间隙死锁。
+
+---
+
+### 11.4 单飞防惊群的秘密武器：事务级咨询锁（Advisory Locks）
+在缓冲池打空时，Shopify 需要防止多个事务同时补货（惊群效应）。在 MySQL 中往往需要借助分布式锁或特殊的单行更新锁。
+
+而在 PostgreSQL 中，拥有一项杀手级特性——**应用层咨询锁（Advisory Locks）**：
+```sql
+-- 尝试获取针对特定商品的事务级咨询锁 (非阻塞尝试)
+SELECT pg_try_advisory_xact_lock(10001); -- 10001 为 item_id
+```
+* 如果返回 `true`，代表当前事务是唯一的胜出者，立即执行从持久账本注水 1,000 行到 `available_units`；
+* 如果返回 `false`，代表已有其他事务正在补货，当前事务直接轻量等待；
+* 事务提交（`COMMIT`）时，**咨询锁自动随事务释放**，完全不需要额外的清理代码或分布式 Redis 协调器。
+
+---
+
+### 11.5 PostgreSQL 落地的特殊注意事项与调优
+
+尽管 PG 语法更强大，但由于底层存储引擎机制与 MySQL InnoDB 不同，需重点防范以下工程陷阱：
+
+1. **追加写 MVCC 与死元组膨胀（Dead Tuples & Vacuuming）**：
+   - MySQL InnoDB 采用原地更新（In-place Update）配合 Undo Log 回滚段；
+   - PostgreSQL 采用多版本追加写（Append-only），频繁的大量 `DELETE` 与 `INSERT` 会在表中产生大量死元组（Dead Tuples）；
+   - **对策**：必须对 `available_units` 与 `reserved_units` 表调激进的 autovacuum 参数：
+     ```sql
+     ALTER TABLE available_units SET (
+         autovacuum_vacuum_scale_factor = 0.05,
+         autovacuum_vacuum_cost_limit = 2000
+     );
+     ```
+   - **或者改用 HOT（Heap-Only Tuples）状态机模式**：
+     如果不做物理 `DELETE` / `INSERT`，而是将表设计为单张状态表（`status = available / reserved`），设置 `fillfactor = 70`，通过 `UPDATE` 状态实现 HOT 更新，完全免除索引更新开销与膨胀。
+2. **连接治理与代理层**：
+   - PostgreSQL 是多进程模型（Fork Process），对超大并发连接更加敏感；
+   - 生产环境中必须标配 **pgBouncer**（Transaction 模式）或新型的 **pgcat** 作为连接池中间件，配合应用层打标（`application_name`），实现类似 Shopify 在 ProxySQL 上的连接持有时间可见性治理。
+
+---
+
 ## 10. 业界类似开源项目与参考实现 (Open Source Ecosystem & Reference Implementations)
 
 在开源社区中，虽然大多数系统仍停留在“Redis 扣减 + MySQL 异步落盘”的传统方案，但越来越多的前沿项目已经开始全面转向由 `SKIP LOCKED` 驱动的数据库原生无锁高并发设计。以下是五个维度的典型代表：
